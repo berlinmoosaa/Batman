@@ -7,6 +7,7 @@ import hashlib
 import time
 import asyncio
 import threading
+import sys
 from telethon import TelegramClient
 from telethon.errors import SessionPasswordNeededError
 
@@ -15,6 +16,11 @@ app.secret_key = 'batman_secret_key_2026'
 CORS(app)
 
 DB_FILE = 'telegram_data.db'
+
+# ==================== WINDOWS ASYNCIO FIX ====================
+# This MUST be called before any asyncio usage
+if sys.platform == 'win32':
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 # ==================== DATABASE TIMEOUT FIX ====================
 def get_db_connection(db_path):
@@ -28,33 +34,31 @@ def get_db_connection(db_path):
 # Store event loop per thread using threading.local()
 _thread_local = threading.local()
 
-def get_event_loop():
-    """Get or create event loop for current thread"""
-    if not hasattr(_thread_local, 'loop'):
-        _thread_local.loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(_thread_local.loop)
-    
-    loop = _thread_local.loop
-    if loop.is_closed():
-        _thread_local.loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(_thread_local.loop)
-        loop = _thread_local.loop
-    
-    return loop
-
-async def create_and_connect_client(session_name, api_id, api_hash):
-    """Async function to create and connect Telegram client"""
-    client = TelegramClient(session_name, int(api_id), api_hash)
-    await client.connect()
-    return client
-
-async def disconnect_client(client):
-    """Async function to disconnect Telegram client"""
-    await client.disconnect()
+def get_or_create_event_loop():
+    """Get or create event loop for current thread - handles Windows properly"""
+    try:
+        # Try to get existing loop
+        loop = asyncio.get_event_loop()
+        if loop.is_closed():
+            raise RuntimeError("Event loop is closed")
+        return loop
+    except (RuntimeError, AttributeError):
+        # Create new loop if none exists or it's closed
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        return loop
 
 def run_async(coro):
-    """Run an async coroutine in the current thread"""
-    loop = get_event_loop()
+    """Run an async coroutine in the current thread - Windows/threading safe"""
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_closed():
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+    
     return loop.run_until_complete(coro)
 
 # Initialize database
