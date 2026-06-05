@@ -6,6 +6,7 @@ from datetime import datetime
 import hashlib
 import time
 import asyncio
+import threading
 from telethon import TelegramClient
 from telethon.errors import SessionPasswordNeededError
 
@@ -24,17 +25,22 @@ def get_db_connection(db_path):
     return conn
 
 # ==================== ASYNCIO EVENT LOOP FIX ====================
+# Store event loop per thread using threading.local()
+_thread_local = threading.local()
+
 def get_event_loop():
     """Get or create event loop for current thread"""
-    try:
-        loop = asyncio.get_event_loop()
-        if loop.is_closed():
-            raise RuntimeError("Event loop is closed")
-        return loop
-    except RuntimeError:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        return loop
+    if not hasattr(_thread_local, 'loop'):
+        _thread_local.loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(_thread_local.loop)
+    
+    loop = _thread_local.loop
+    if loop.is_closed():
+        _thread_local.loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(_thread_local.loop)
+        loop = _thread_local.loop
+    
+    return loop
 
 async def create_and_connect_client(session_name, api_id, api_hash):
     """Async function to create and connect Telegram client"""
