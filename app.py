@@ -4,8 +4,8 @@ import os
 import sqlite3
 from datetime import datetime
 import hashlib
-import threading
 import time
+import asyncio
 from telethon import TelegramClient
 from telethon.errors import SessionPasswordNeededError
 
@@ -23,42 +23,33 @@ def get_db_connection(db_path):
     conn.execute('PRAGMA busy_timeout = 5000')
     return conn
 
-# ==================== TELETHON ASYNC HANDLER ====================
-import asyncio
-from telethon.sync import TelegramClient as SyncTelegramClient
+# ==================== ASYNCIO EVENT LOOP FIX ====================
+def get_event_loop():
+    """Get or create event loop for current thread"""
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_closed():
+            raise RuntimeError("Event loop is closed")
+        return loop
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        return loop
 
-class TelegramClientManager:
-    """Thread-safe manager for Telethon clients using async properly"""
-    _lock = threading.Lock()
-    _clients = {}
-    
-    @classmethod
-    def get_client_sync(cls, session_name, api_id, api_hash):
-        """Get or create a synchronous Telethon client"""
-        with cls._lock:
-            if session_name not in cls._clients:
-                try:
-                    print(f"[INFO] Creating new client for {session_name}")
-                    # Use SyncTelegramClient which handles asyncio internally
-                    client = SyncTelegramClient(session_name, int(api_id), api_hash)
-                    with client:
-                        pass  # Just connect and disconnect to verify
-                    cls._clients[session_name] = SyncTelegramClient(session_name, int(api_id), api_hash)
-                except Exception as e:
-                    print(f"[ERROR] Failed to create client: {e}")
-                    raise
-            return cls._clients[session_name]
-    
-    @classmethod
-    def disconnect_client(cls, session_name):
-        """Safely disconnect a client"""
-        with cls._lock:
-            if session_name in cls._clients:
-                try:
-                    cls._clients[session_name].disconnect()
-                except:
-                    pass
-                del cls._clients[session_name]
+async def create_and_connect_client(session_name, api_id, api_hash):
+    """Async function to create and connect Telegram client"""
+    client = TelegramClient(session_name, int(api_id), api_hash)
+    await client.connect()
+    return client
+
+async def disconnect_client(client):
+    """Async function to disconnect Telegram client"""
+    await client.disconnect()
+
+def run_async(coro):
+    """Run an async coroutine in the current thread"""
+    loop = get_event_loop()
+    return loop.run_until_complete(coro)
 
 # Initialize database
 conn = get_db_connection(DB_FILE)
@@ -171,28 +162,36 @@ def login():
             print(f"[API] login called")
             print(f"[API] Phone received: {phone}")
             
-            # Create a context-based client connection
-            with SyncTelegramClient(session_name, int(api_id), api_hash) as client:
+            async def login_async():
+                client = TelegramClient(session_name, int(api_id), api_hash)
+                await client.connect()
+                
                 print(f"[API] Connected to Telegram")
                 
-                if not client.is_user_authorized():
+                if not await client.is_user_authorized():
                     print(f"[API] Not authorized, sending code request")
-                    client.send_code_request(phone)
-                    return jsonify({
+                    await client.send_code_request(phone)
+                    await client.disconnect()
+                    return {
                         'success': True,
                         'status': 'code_required',
                         'phone': phone,
                         'session_name': session_name
-                    })
+                    }
                 else:
                     print(f"[API] Already authorized")
                     account_id = save_account(phone, session_name)
-                    return jsonify({
+                    await client.disconnect()
+                    return {
                         'success': True,
                         'status': 'logged_in',
                         'account_id': account_id,
                         'phone': phone
-                    })
+                    }
+            
+            result = run_async(login_async())
+            return jsonify(result)
+            
         except Exception as e:
             print(f"[API] EXCEPTION: {str(e)}")
             import traceback
@@ -216,22 +215,33 @@ def verify():
             return jsonify({'error': 'API credentials not found'}), 400
         
         try:
-            with SyncTelegramClient(session_name, int(api_id), api_hash) as client:
+            async def verify_async():
+                client = TelegramClient(session_name, int(api_id), api_hash)
+                await client.connect()
+                
                 try:
                     print(f"[API] Attempting to sign in with code")
-                    client.sign_in(phone, code)
+                    await client.sign_in(phone, code)
                 except SessionPasswordNeededError:
-                    return jsonify({'error': '2FA not supported yet'}), 400
+                    await client.disconnect()
+                    return {'error': '2FA not supported yet'}
                 
                 account_id = save_account(phone, session_name)
-                
                 print(f"[API] Successfully verified account")
-                return jsonify({
+                await client.disconnect()
+                
+                return {
                     'success': True,
                     'status': 'verified',
                     'account_id': account_id,
                     'phone': phone
-                })
+                }
+            
+            result = run_async(verify_async())
+            if 'error' in result:
+                return jsonify(result), 400
+            return jsonify(result)
+            
         except Exception as e:
             print(f"[API] Verification error: {str(e)}")
             import traceback
@@ -269,10 +279,13 @@ def load_groups():
         session_name = account[2]
         
         try:
-            with SyncTelegramClient(session_name, int(api_id), api_hash) as client:
+            async def load_groups_async():
+                client = TelegramClient(session_name, int(api_id), api_hash)
+                await client.connect()
+                
                 print(f"[API] Loading groups for account {account_id}")
                 groups = []
-                for dialog in client.get_dialogs():
+                async for dialog in client.get_dialogs():
                     if dialog.is_group or dialog.is_channel:
                         groups.append({
                             'id': dialog.id,
@@ -283,8 +296,12 @@ def load_groups():
                 
                 save_groups(account_id, groups)
                 print(f"[API] Loaded {len(groups)} groups")
+                await client.disconnect()
                 
-                return jsonify({'success': True, 'groups': groups, 'count': len(groups)})
+                return {'success': True, 'groups': groups, 'count': len(groups)}
+            
+            result = run_async(load_groups_async())
+            return jsonify(result)
         except Exception as e:
             print(f"[API] Load groups error: {str(e)}")
             import traceback
@@ -319,19 +336,22 @@ def send_message():
         accounts = get_all_accounts()
         results = []
         
-        for account_id in account_ids:
-            account = next((acc for acc in accounts if acc[0] == account_id), None)
-            if not account:
-                continue
-            
-            session_name = account[2]
-            
-            try:
-                with SyncTelegramClient(session_name, int(api_id), api_hash) as client:
+        async def send_messages_async():
+            for account_id in account_ids:
+                account = next((acc for acc in accounts if acc[0] == account_id), None)
+                if not account:
+                    continue
+                
+                session_name = account[2]
+                
+                try:
+                    client = TelegramClient(session_name, int(api_id), api_hash)
+                    await client.connect()
+                    
                     for group_id in group_ids:
                         try:
-                            time.sleep(delay)
-                            client.send_message(int(group_id), message)
+                            await asyncio.sleep(delay)
+                            await client.send_message(int(group_id), message)
                             print(f"[API] Message sent to group {group_id}")
                             results.append({
                                 'account_id': account_id,
@@ -346,14 +366,18 @@ def send_message():
                                 'status': 'failed',
                                 'error': str(e)
                             })
-            except Exception as e:
-                print(f"[API] Send message error for account {account_id}: {str(e)}")
-                results.append({
-                    'account_id': account_id,
-                    'group_id': 'all',
-                    'status': 'failed',
-                    'error': str(e)
-                })
+                    
+                    await client.disconnect()
+                except Exception as e:
+                    print(f"[API] Send message error for account {account_id}: {str(e)}")
+                    results.append({
+                        'account_id': account_id,
+                        'group_id': 'all',
+                        'status': 'failed',
+                        'error': str(e)
+                    })
+        
+        run_async(send_messages_async())
         
         return jsonify({
             'success': True,
