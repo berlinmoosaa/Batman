@@ -6,7 +6,7 @@ import os
 import sqlite3
 from datetime import datetime
 import hashlib
-from contextlib import contextmanager
+import threading
 import time
 
 app = Flask(__name__)
@@ -16,39 +16,43 @@ CORS(app)
 DB_FILE = 'telegram_data.db'
 
 # ==================== DATABASE TIMEOUT FIX ====================
-# Set global SQLite timeout for database locking
-sqlite3.connect(':memory:').timeout = 10.0
-
 def get_db_connection(db_path):
     """Create a database connection with timeout and WAL mode enabled"""
     conn = sqlite3.connect(db_path, timeout=20.0, check_same_thread=False)
-    conn.execute('PRAGMA journal_mode=WAL')  # Enable Write-Ahead Logging
-    conn.execute('PRAGMA busy_timeout = 5000')  # 5 second timeout
+    conn.execute('PRAGMA journal_mode=WAL')
+    conn.execute('PRAGMA busy_timeout = 5000')
     return conn
 
-# ==================== TELETHON CLIENT CONTEXT MANAGER ====================
-@contextmanager
-def get_telegram_client(session_name, api_id, api_hash):
-    """Context manager for safe Telethon client handling"""
-    client = None
-    try:
-        client = TelegramClient(
-            session_name, 
-            int(api_id), 
-            api_hash,
-            system_version="4.16.30.45",
-            timeout=30  # Add timeout
-        )
-        client.connect()
-        yield client
-    except Exception as e:
-        raise e
-    finally:
-        if client:
-            try:
-                client.disconnect()
-            except:
-                pass
+# ==================== TELETHON THREAD-SAFE HANDLER ====================
+class TelegramClientManager:
+    """Thread-safe manager for Telethon clients"""
+    _lock = threading.Lock()
+    _clients = {}
+    
+    @classmethod
+    def get_client(cls, session_name, api_id, api_hash):
+        """Get or create a client for the session"""
+        with cls._lock:
+            if session_name not in cls._clients:
+                try:
+                    client = TelegramClient(session_name, int(api_id), api_hash)
+                    client.connect()
+                    cls._clients[session_name] = client
+                except Exception as e:
+                    print(f"[ERROR] Failed to create client: {e}")
+                    raise
+            return cls._clients[session_name]
+    
+    @classmethod
+    def disconnect_client(cls, session_name):
+        """Safely disconnect a client"""
+        with cls._lock:
+            if session_name in cls._clients:
+                try:
+                    cls._clients[session_name].disconnect()
+                except:
+                    pass
+                del cls._clients[session_name]
 
 # Initialize database
 conn = get_db_connection(DB_FILE)
@@ -157,28 +161,39 @@ def login():
         session_name = f'session_{hashlib.md5(phone.encode()).hexdigest()}'
         
         try:
-            # Use context manager for safe client handling
-            with get_telegram_client(session_name, api_id, api_hash) as client:
-                if not client.is_user_authorized():
-                    client.send_code_request(phone)
-                    return jsonify({
-                        'success': True,
-                        'status': 'code_required',
-                        'phone': phone,
-                        'session_name': session_name
-                    })
-                else:
-                    account_id = save_account(phone, session_name)
-                    return jsonify({
-                        'success': True,
-                        'status': 'logged_in',
-                        'account_id': account_id,
-                        'phone': phone
-                    })
+            print(f"[API] login called")
+            print(f"[API] Phone received: {phone}")
+            
+            # Use TelegramClientManager for thread-safe operations
+            client = TelegramClientManager.get_client(session_name, api_id, api_hash)
+            
+            print(f"[API] Creating Telethon client...")
+            
+            if not client.is_user_authorized():
+                print(f"[API] Not authorized, sending code request")
+                client.send_code_request(phone)
+                return jsonify({
+                    'success': True,
+                    'status': 'code_required',
+                    'phone': phone,
+                    'session_name': session_name
+                })
+            else:
+                print(f"[API] Already authorized")
+                account_id = save_account(phone, session_name)
+                return jsonify({
+                    'success': True,
+                    'status': 'logged_in',
+                    'account_id': account_id,
+                    'phone': phone
+                })
         except Exception as e:
             print(f"[API] EXCEPTION: {str(e)}")
+            import traceback
+            traceback.print_exc()
             return jsonify({'error': f'Telegram error: {str(e)}'}), 400
     except Exception as e:
+        print(f"[API] General error: {str(e)}")
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/verify-code', methods=['POST'])
@@ -195,23 +210,27 @@ def verify():
             return jsonify({'error': 'API credentials not found'}), 400
         
         try:
-            # Use context manager for safe client handling
-            with get_telegram_client(session_name, api_id, api_hash) as client:
-                try:
-                    client.sign_in(phone, code)
-                except SessionPasswordNeededError:
-                    return jsonify({'error': '2FA not supported yet'}), 400
-                
-                account_id = save_account(phone, session_name)
-                
-                return jsonify({
-                    'success': True,
-                    'status': 'verified',
-                    'account_id': account_id,
-                    'phone': phone
-                })
+            client = TelegramClientManager.get_client(session_name, api_id, api_hash)
+            
+            try:
+                print(f"[API] Attempting to sign in with code")
+                client.sign_in(phone, code)
+            except SessionPasswordNeededError:
+                return jsonify({'error': '2FA not supported yet'}), 400
+            
+            account_id = save_account(phone, session_name)
+            
+            print(f"[API] Successfully verified account")
+            return jsonify({
+                'success': True,
+                'status': 'verified',
+                'account_id': account_id,
+                'phone': phone
+            })
         except Exception as e:
             print(f"[API] Verification error: {str(e)}")
+            import traceback
+            traceback.print_exc()
             return jsonify({'error': f'Verification failed: {str(e)}'}), 400
     except Exception as e:
         return jsonify({'error': str(e)}), 500
@@ -245,23 +264,27 @@ def load_groups():
         session_name = account[2]
         
         try:
-            # Use context manager for safe client handling
-            with get_telegram_client(session_name, api_id, api_hash) as client:
-                groups = []
-                for dialog in client.get_dialogs():
-                    if dialog.is_group or dialog.is_channel:
-                        groups.append({
-                            'id': dialog.id,
-                            'title': dialog.title,
-                            'username': dialog.entity.username if hasattr(dialog.entity, 'username') else None,
-                            'members_count': dialog.entity.participants_count if hasattr(dialog.entity, 'participants_count') else 0
-                        })
-                
-                save_groups(account_id, groups)
-                
-                return jsonify({'success': True, 'groups': groups, 'count': len(groups)})
+            client = TelegramClientManager.get_client(session_name, api_id, api_hash)
+            
+            print(f"[API] Loading groups for account {account_id}")
+            groups = []
+            for dialog in client.get_dialogs():
+                if dialog.is_group or dialog.is_channel:
+                    groups.append({
+                        'id': dialog.id,
+                        'title': dialog.title,
+                        'username': dialog.entity.username if hasattr(dialog.entity, 'username') else None,
+                        'members_count': dialog.entity.participants_count if hasattr(dialog.entity, 'participants_count') else 0
+                    })
+            
+            save_groups(account_id, groups)
+            print(f"[API] Loaded {len(groups)} groups")
+            
+            return jsonify({'success': True, 'groups': groups, 'count': len(groups)})
         except Exception as e:
             print(f"[API] Load groups error: {str(e)}")
+            import traceback
+            traceback.print_exc()
             return jsonify({'error': str(e)}), 400
     except Exception as e:
         return jsonify({'error': str(e)}), 500
@@ -300,24 +323,26 @@ def send_message():
             session_name = account[2]
             
             try:
-                # Use context manager for safe client handling
-                with get_telegram_client(session_name, api_id, api_hash) as client:
-                    for group_id in group_ids:
-                        try:
-                            time.sleep(delay)
-                            client.send_message(int(group_id), message)
-                            results.append({
-                                'account_id': account_id,
-                                'group_id': group_id,
-                                'status': 'sent'
-                            })
-                        except Exception as e:
-                            results.append({
-                                'account_id': account_id,
-                                'group_id': group_id,
-                                'status': 'failed',
-                                'error': str(e)
-                            })
+                client = TelegramClientManager.get_client(session_name, api_id, api_hash)
+                
+                for group_id in group_ids:
+                    try:
+                        time.sleep(delay)
+                        client.send_message(int(group_id), message)
+                        print(f"[API] Message sent to group {group_id}")
+                        results.append({
+                            'account_id': account_id,
+                            'group_id': group_id,
+                            'status': 'sent'
+                        })
+                    except Exception as e:
+                        print(f"[API] Failed to send message: {str(e)}")
+                        results.append({
+                            'account_id': account_id,
+                            'group_id': group_id,
+                            'status': 'failed',
+                            'error': str(e)
+                        })
             except Exception as e:
                 print(f"[API] Send message error for account {account_id}: {str(e)}")
                 results.append({
@@ -336,4 +361,4 @@ def send_message():
         return jsonify({'error': str(e)}), 500
 
 if __name__ == '__main__':
-    app.run(debug=True, host='localhost', port=5000)
+    app.run(debug=True, host='localhost', port=5000, threaded=True)
