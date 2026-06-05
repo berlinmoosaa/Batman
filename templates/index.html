@@ -1,0 +1,239 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Batman - Telegram Multi-Account Manager</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+</head>
+<body>
+    <div class="container">
+        <!-- Sidebar -->
+        <aside class="sidebar">
+            <div class="sidebar-header">
+                <i class="fas fa-mask bat-icon"></i>
+                <h1>BATMAN</h1>
+            </div>
+            <nav class="sidebar-nav">
+                <a href="#" class="nav-item active" data-page="settings">
+                    <i class="fas fa-cogs"></i>
+                    <span>Settings</span>
+                </a>
+                <a href="#" class="nav-item" data-page="accounts">
+                    <i class="fas fa-users"></i>
+                    <span>Accounts</span>
+                </a>
+                <a href="#" class="nav-item" data-page="groups">
+                    <i class="fas fa-layer-group"></i>
+                    <span>Groups</span>
+                </a>
+                <a href="#" class="nav-item" data-page="messages">
+                    <i class="fas fa-paper-plane"></i>
+                    <span>Send Messages</span>
+                </a>
+            </nav>
+        </aside>
+
+        <!-- Main Content -->
+        <main class="main-content">
+            <!-- Settings Page -->
+            <section id="settings-page" class="page active">
+                <div class="page-header">
+                    <h2>API Settings</h2>
+                    <p>Configure your Telegram API credentials</p>
+                </div>
+
+                <div class="card">
+                    <div class="card-header">
+                        <h3>First Time Setup</h3>
+                    </div>
+                    <div class="card-body">
+                        <div id="settings-form" class="form-group">
+                            <div class="form-field">
+                                <label for="api-id">Telegram API ID</label>
+                                <input type="text" id="api-id" placeholder="Enter your API ID" required>
+                            </div>
+                            <div class="form-field">
+                                <label for="api-hash">Telegram API Hash</label>
+                                <input type="text" id="api-hash" placeholder="Enter your API Hash" required>
+                            </div>
+                            <button class="btn btn-primary" id="save-settings-btn">
+                                <i class="fas fa-save"></i> Save Settings
+                            </button>
+                        </div>
+                        <div id="settings-status" class="settings-status hidden">
+                            <div class="success-badge">
+                                <i class="fas fa-check-circle"></i>
+                                <span>Settings Saved Successfully!</span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Accounts Page -->
+            <section id="accounts-page" class="page">
+                <div class="page-header">
+                    <h2>Telegram Accounts</h2>
+                    <p>Manage your connected accounts</p>
+                </div>
+
+                <div class="card">
+                    <div class="card-header">
+                        <h3>Add New Account</h3>
+                    </div>
+                    <div class="card-body">
+                        <div id="login-form" class="form-group">
+                            <div class="form-field">
+                                <label for="phone-input">Phone Number</label>
+                                <input type="tel" id="phone-input" placeholder="+1234567890" required>
+                            </div>
+                            <button class="btn btn-primary" id="login-btn">
+                                <i class="fas fa-sign-in-alt"></i> Login
+                            </button>
+                        </div>
+                        <div id="code-form" class="form-group hidden">
+                            <div class="form-field">
+                                <label for="code-input">Verification Code</label>
+                                <input type="text" id="code-input" placeholder="Enter code" required>
+                            </div>
+                            <button class="btn btn-primary" id="verify-code-btn">
+                                <i class="fas fa-check"></i> Verify
+                            </button>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="card">
+                    <div class="card-header">
+                        <h3>Connected Accounts</h3>
+                    </div>
+                    <div class="card-body">
+                        <div id="accounts-list" class="accounts-grid">
+                            <!-- Accounts will be populated here -->
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Groups Page -->
+            <section id="groups-page" class="page">
+                <div class="page-header">
+                    <h2>Load Groups</h2>
+                    <p>Load and manage your joined groups</p>
+                </div>
+
+                <div class="card">
+                    <div class="card-header">
+                        <h3>Select Account & Load Groups</h3>
+                    </div>
+                    <div class="card-body">
+                        <div class="form-group">
+                            <div class="form-field">
+                                <label for="account-select">Choose Account</label>
+                                <select id="account-select">
+                                    <option value="">Select an account...</option>
+                                </select>
+                            </div>
+                            <button class="btn btn-primary" id="load-groups-btn">
+                                <i class="fas fa-sync-alt"></i> Load Groups
+                            </button>
+                        </div>
+                        <div id="loading-spinner" class="spinner hidden">
+                            <div class="spinner-circle"></div>
+                            <p>Loading groups...</p>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="card">
+                    <div class="card-header">
+                        <h3>Available Groups</h3>
+                    </div>
+                    <div class="card-body">
+                        <div id="groups-list" class="groups-list">
+                            <!-- Groups will be populated here -->
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Messages Page -->
+            <section id="messages-page" class="page">
+                <div class="page-header">
+                    <h2>Send Messages</h2>
+                    <p>Send messages to multiple groups from multiple accounts</p>
+                </div>
+
+                <div class="card">
+                    <div class="card-header">
+                        <h3>Message Configuration</h3>
+                    </div>
+                    <div class="card-body">
+                        <div class="form-group">
+                            <div class="form-field">
+                                <label for="message-text">Message</label>
+                                <textarea id="message-text" placeholder="Enter your message" rows="5"></textarea>
+                            </div>
+                            <div class="form-field">
+                                <label for="delay-input">Delay Between Messages (seconds)</label>
+                                <input type="number" id="delay-input" value="1" min="0" max="10">
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="card">
+                    <div class="card-header">
+                        <h3>Select Accounts & Groups</h3>
+                    </div>
+                    <div class="card-body">
+                        <div class="selection-container">
+                            <div class="selection-column">
+                                <h4>Accounts</h4>
+                                <div id="accounts-checkbox-list" class="checkbox-list">
+                                    <!-- Accounts checkboxes will be populated here -->
+                                </div>
+                            </div>
+                            <div class="selection-column">
+                                <h4>Groups</h4>
+                                <div id="groups-checkbox-list" class="checkbox-list">
+                                    <!-- Groups checkboxes will be populated here -->
+                                </div>
+                            </div>
+                        </div>
+                        <div class="button-group">
+                            <button class="btn btn-secondary" id="select-all-accounts-btn">
+                                <i class="fas fa-check-double"></i> Select All Accounts
+                            </button>
+                            <button class="btn btn-secondary" id="select-all-groups-btn">
+                                <i class="fas fa-check-double"></i> Select All Groups
+                            </button>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="card">
+                    <div class="card-body">
+                        <button class="btn btn-success btn-large" id="send-message-btn">
+                            <i class="fas fa-paper-plane"></i> Send Messages
+                        </button>
+                    </div>
+                </div>
+
+                <div id="send-results" class="card hidden">
+                    <div class="card-header">
+                        <h3>Send Results</h3>
+                    </div>
+                    <div class="card-body">
+                        <div id="results-content"></div>
+                    </div>
+                </div>
+            </section>
+        </main>
+    </div>
+
+    <script src="{{ url_for('static', filename='js/app.js') }}"></script>
+</body>
+</html>

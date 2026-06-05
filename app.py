@@ -1,320 +1,308 @@
-#!/usr/bin/env python3
-"""
-Flask Web Application for Batman - Telegram Manager
-Replaces PyQt6 with a simple, easy-to-use web interface
-"""
-
-from flask import Flask, render_template, request, jsonify
-from flask_socketio import SocketIO, emit
-import asyncio
-import threading
+from flask import Flask, render_template, request, jsonify, session
+from flask_cors import CORS
+from telethon.sync import TelegramClient
+from telethon.errors import SessionPasswordNeededError
+import json
+import os
+import sqlite3
 from datetime import datetime
-from config import config
-from account_manager import account_manager
-from group_manager import group_manager
+import hashlib
 
-# Initialize Flask app
 app = Flask(__name__)
-app.config['SECRET_KEY'] = 'batman-secret-key-2024'
-socketio = SocketIO(app, cors_allowed_origins="*")
+app.secret_key = 'batman_secret_key_2026'
+CORS(app)
 
-# Store async loop
-loop = None
+# Database setup
+DB_FILE = 'telegram_data.db'
 
-def start_asyncio_loop():
-    """Start asyncio event loop in background thread"""
-    global loop
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    
-    def run_loop():
-        loop.run_forever()
-    
-    thread = threading.Thread(target=run_loop, daemon=True)
-    thread.start()
-    return loop
+def init_db():
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS settings
+                (id INTEGER PRIMARY KEY, api_id TEXT, api_hash TEXT)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS accounts
+                (id INTEGER PRIMARY KEY, phone TEXT, session_name TEXT, created_at TIMESTAMP)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS groups
+                (id INTEGER PRIMARY KEY, account_id INTEGER, group_id INTEGER, group_name TEXT, 
+                 group_username TEXT, members_count INTEGER, created_at TIMESTAMP)''')
+    conn.commit()
+    conn.close()
 
-def emit_log(message):
-    """Emit log message to all connected clients"""
-    socketio.emit('log', {
-        'message': message,
-        'timestamp': datetime.now().strftime('%H:%M:%S')
-    }, broadcast=True)
+init_db()
 
-def run_async(coro):
-    """Run async coroutine in the background loop"""
-    return asyncio.run_coroutine_threadsafe(coro, loop)
+def get_api_credentials():
+    """Get API credentials from database"""
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('SELECT api_id, api_hash FROM settings LIMIT 1')
+    result = c.fetchone()
+    conn.close()
+    return result if result else (None, None)
 
-# ==================== WEB ROUTES ====================
+def save_api_credentials(api_id, api_hash):
+    """Save API credentials to database"""
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('DELETE FROM settings')
+    c.execute('INSERT INTO settings (api_id, api_hash) VALUES (?, ?)', (api_id, api_hash))
+    conn.commit()
+    conn.close()
+
+def get_all_accounts():
+    """Get all registered accounts"""
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('SELECT id, phone, session_name, created_at FROM accounts')
+    accounts = c.fetchall()
+    conn.close()
+    return accounts
+
+def save_account(phone, session_name):
+    """Save account to database"""
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('INSERT INTO accounts (phone, session_name, created_at) VALUES (?, ?, ?)',
+              (phone, session_name, datetime.now()))
+    conn.commit()
+    account_id = c.lastrowid
+    conn.close()
+    return account_id
+
+def get_groups_for_account(account_id):
+    """Get all groups for a specific account"""
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('SELECT id, group_id, group_name, group_username, members_count FROM groups WHERE account_id = ?',
+              (account_id,))
+    groups = c.fetchall()
+    conn.close()
+    return groups
+
+def save_groups(account_id, groups_list):
+    """Save groups for account"""
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('DELETE FROM groups WHERE account_id = ?', (account_id,))
+    for group in groups_list:
+        c.execute('INSERT INTO groups (account_id, group_id, group_name, group_username, members_count, created_at) '
+                  'VALUES (?, ?, ?, ?, ?, ?)',
+                  (account_id, group.get('id'), group.get('title'), group.get('username', 'N/A'), 
+                   group.get('members_count', 0), datetime.now()))
+    conn.commit()
+    conn.close()
 
 @app.route('/')
 def index():
-    """Main page"""
     return render_template('index.html')
 
-@app.route('/api/status')
-def api_status():
-    """Get application status"""
+@app.route('/api/check-settings', methods=['GET'])
+def check_settings():
+    api_id, api_hash = get_api_credentials()
     return jsonify({
-        'configured': config.is_configured(),
-        'accounts': len(account_manager.get_accounts())
+        'has_credentials': api_id is not None and api_hash is not None,
+        'api_id': api_id
     })
 
-@app.route('/api/config', methods=['GET', 'POST'])
-def api_config():
-    """Get or save configuration"""
-    if request.method == 'GET':
-        return jsonify({
-            'configured': config.is_configured(),
-            'api_id': config.api_id if config.is_configured() else None
-        })
+@app.route('/api/save-settings', methods=['POST'])
+def save_settings():
+    data = request.json
+    api_id = data.get('api_id')
+    api_hash = data.get('api_hash')
     
-    elif request.method == 'POST':
-        data = request.json
-        api_id = data.get('api_id', '').strip()
-        api_hash = data.get('api_hash', '').strip()
+    if not api_id or not api_hash:
+        return jsonify({'error': 'API ID and Hash required'}), 400
+    
+    save_api_credentials(api_id, api_hash)
+    return jsonify({'success': True, 'message': 'Settings saved successfully'})
+
+@app.route('/api/login', methods=['POST'])
+def login_account():
+    data = request.json
+    phone = data.get('phone')
+    
+    if not phone:
+        return jsonify({'error': 'Phone number required'}), 400
+    
+    api_id, api_hash = get_api_credentials()
+    if not api_id or not api_hash:
+        return jsonify({'error': 'API credentials not set'}), 400
+    
+    try:
+        session_name = f'session_{hashlib.md5(phone.encode()).hexdigest()}'
+        client = TelegramClient(session_name, int(api_id), api_hash)
+        client.connect()
         
-        if not api_id or not api_hash:
-            return jsonify({'success': False, 'error': 'Missing API credentials'}), 400
+        if not client.is_user_authorized():
+            client.send_code_request(phone)
+            return jsonify({
+                'success': True,
+                'status': 'code_required',
+                'phone': phone,
+                'session_name': session_name
+            })
+        else:
+            account_id = save_account(phone, session_name)
+            client.disconnect()
+            return jsonify({
+                'success': True,
+                'status': 'logged_in',
+                'account_id': account_id,
+                'phone': phone
+            })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 400
+
+@app.route('/api/verify-code', methods=['POST'])
+def verify_code():
+    data = request.json
+    phone = data.get('phone')
+    code = data.get('code')
+    session_name = data.get('session_name')
+    
+    api_id, api_hash = get_api_credentials()
+    
+    try:
+        client = TelegramClient(session_name, int(api_id), api_hash)
+        client.connect()
         
         try:
-            api_id = int(api_id)
-            config.save_config(api_id, api_hash)
-            emit_log(f"✓ Configuration saved successfully")
-            return jsonify({'success': True})
-        except ValueError:
-            return jsonify({'success': False, 'error': 'API ID must be a number'}), 400
-        except Exception as e:
-            return jsonify({'success': False, 'error': str(e)}), 500
-
-@app.route('/api/accounts', methods=['GET', 'POST'])
-def api_accounts():
-    """Get or add accounts"""
-    if request.method == 'GET':
-        accounts = account_manager.get_accounts()
-        return jsonify({'accounts': accounts})
-    
-    elif request.method == 'POST':
-        data = request.json
-        phone = data.get('phone', '').strip()
+            client.sign_in(phone, code)
+        except SessionPasswordNeededError:
+            return jsonify({
+                'status': 'password_required',
+                'session_name': session_name,
+                'phone': phone
+            })
         
-        if not phone:
-            return jsonify({'success': False, 'error': 'Phone number required'}), 400
+        account_id = save_account(phone, session_name)
+        client.disconnect()
         
-        if not config.is_configured():
-            return jsonify({'success': False, 'error': 'Please configure API credentials first'}), 400
-        
-        success, message = account_manager.add_account(phone)
-        if success:
-            emit_log(f"✓ Account added: {phone}")
-            # Start async connection
-            run_async(account_manager.connect_account(phone))
-            return jsonify({'success': True, 'message': message})
-        else:
-            return jsonify({'success': False, 'error': message}), 400
-
-@app.route('/api/accounts/<phone>', methods=['DELETE'])
-def delete_account(phone):
-    """Delete an account"""
-    try:
-        account_manager.remove_account(phone)
-        emit_log(f"✗ Account removed: {phone}")
-        return jsonify({'success': True})
+        return jsonify({
+            'success': True,
+            'status': 'verified',
+            'account_id': account_id,
+            'phone': phone
+        })
     except Exception as e:
-        return jsonify({'success': False, 'error': str(e)}), 500
+        return jsonify({'error': str(e)}), 400
 
-@app.route('/api/accounts/<phone>/verify', methods=['POST'])
-def verify_code(phone):
-    """Verify authentication code"""
-    data = request.json
-    code = data.get('code', '').strip()
-    
-    if not code:
-        return jsonify({'success': False, 'error': 'Code required'}), 400
-    
-    future = run_async(account_manager.verify_code(phone, code))
-    try:
-        success, message = future.result(timeout=30)
-        if success:
-            emit_log(f"✓ {phone} verified successfully")
-            return jsonify({'success': True, 'message': message})
-        else:
-            emit_log(f"✗ {phone}: {message}")
-            return jsonify({'success': False, 'error': message}), 400
-    except Exception as e:
-        return jsonify({'success': False, 'error': str(e)}), 500
+@app.route('/api/accounts', methods=['GET'])
+def get_accounts():
+    accounts = get_all_accounts()
+    return jsonify({
+        'accounts': [
+            {'id': acc[0], 'phone': acc[1], 'session_name': acc[2], 'created_at': acc[3]}
+            for acc in accounts
+        ]
+    })
 
-@app.route('/api/accounts/<phone>/verify-password', methods=['POST'])
-def verify_password(phone):
-    """Verify 2FA password"""
-    data = request.json
-    password = data.get('password', '').strip()
-    
-    if not password:
-        return jsonify({'success': False, 'error': 'Password required'}), 400
-    
-    future = run_async(account_manager.verify_password(phone, password))
-    try:
-        success, message = future.result(timeout=30)
-        if success:
-            emit_log(f"✓ {phone} 2FA verified")
-            return jsonify({'success': True, 'message': message})
-        else:
-            emit_log(f"✗ {phone}: {message}")
-            return jsonify({'success': False, 'error': message}), 400
-    except Exception as e:
-        return jsonify({'success': False, 'error': str(e)}), 500
-
-@app.route('/api/accounts/<phone>/disconnect', methods=['POST'])
-def disconnect_account(phone):
-    """Disconnect account"""
-    try:
-        run_async(account_manager.disconnect_account(phone))
-        emit_log(f"✗ Disconnected: {phone}")
-        return jsonify({'success': True})
-    except Exception as e:
-        return jsonify({'success': False, 'error': str(e)}), 500
-
-@app.route('/api/groups/load', methods=['POST'])
+@app.route('/api/load-groups', methods=['POST'])
 def load_groups():
-    """Load groups for an account"""
     data = request.json
-    phone = data.get('phone', '').strip()
+    account_id = data.get('account_id')
     
-    if not phone:
-        return jsonify({'success': False, 'error': 'Phone required'}), 400
+    if not account_id:
+        return jsonify({'error': 'Account ID required'}), 400
     
-    async def async_load():
-        emit_log(f"⏳ Loading groups from {phone}...")
-        client = await account_manager.get_client(phone)
-        
-        if not client:
-            emit_log(f"✗ Cannot connect to {phone}")
-            return []
-        
-        groups = await group_manager.load_groups(client)
-        emit_log(f"✓ Loaded {len(groups)} groups from {phone}")
-        return groups
+    accounts = get_all_accounts()
+    account = next((acc for acc in accounts if acc[0] == account_id), None)
     
-    future = run_async(async_load())
-    try:
-        groups = future.result(timeout=120)
-        return jsonify({'success': True, 'groups': groups})
-    except Exception as e:
-        emit_log(f"✗ Error loading groups: {str(e)}")
-        return jsonify({'success': False, 'error': str(e)}), 500
-
-@app.route('/api/groups/save', methods=['POST'])
-def save_groups():
-    """Save selected groups for an account"""
-    data = request.json
-    phone = data.get('phone', '').strip()
-    groups = data.get('groups', [])
+    if not account:
+        return jsonify({'error': 'Account not found'}), 404
     
-    if not phone:
-        return jsonify({'success': False, 'error': 'Phone required'}), 400
+    api_id, api_hash = get_api_credentials()
+    session_name = account[2]
     
     try:
-        account_manager.update_groups(phone, groups)
-        emit_log(f"✓ Saved {len(groups)} groups for {phone}")
-        return jsonify({'success': True})
-    except Exception as e:
-        return jsonify({'success': False, 'error': str(e)}), 500
-
-@app.route('/api/broadcast', methods=['POST'])
-def broadcast():
-    """Broadcast message to all selected groups"""
-    data = request.json
-    message = data.get('message', '').strip()
-    delay = int(data.get('delay', 3))
-    use_markdown = data.get('markdown', True)
-    
-    if not message:
-        return jsonify({'success': False, 'error': 'Message required'}), 400
-    
-    if delay < 1:
-        delay = 1
-    if delay > 3600:
-        delay = 3600
-    
-    async def async_broadcast():
-        accounts = account_manager.get_accounts()
-        total_sent = 0
+        client = TelegramClient(session_name, int(api_id), api_hash)
+        client.connect()
         
-        for account in accounts:
-            phone = account['phone']
-            client = await account_manager.get_client(phone)
-            
-            if not client:
-                emit_log(f"⊘ Skipping {phone}: Not connected")
+        groups = []
+        async def fetch_groups():
+            async for dialog in client.get_dialogs():
+                if dialog.is_group or dialog.is_channel:
+                    groups.append({
+                        'id': dialog.id,
+                        'title': dialog.title,
+                        'username': dialog.entity.username if hasattr(dialog.entity, 'username') else None,
+                        'members_count': dialog.entity.participants_count if hasattr(dialog.entity, 'participants_count') else 0
+                    })
+        
+        client.loop.run_until_complete(fetch_groups())
+        
+        save_groups(account_id, groups)
+        client.disconnect()
+        
+        return jsonify({
+            'success': True,
+            'groups': groups,
+            'count': len(groups)
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 400
+
+@app.route('/api/groups/<int:account_id>', methods=['GET'])
+def get_account_groups(account_id):
+    groups = get_groups_for_account(account_id)
+    return jsonify({
+        'groups': [
+            {'id': g[0], 'group_id': g[1], 'name': g[2], 'username': g[3], 'members': g[4]}
+            for g in groups
+        ]
+    })
+
+@app.route('/api/send-message', methods=['POST'])
+def send_message():
+    data = request.json
+    account_ids = data.get('account_ids', [])
+    group_ids = data.get('group_ids', [])
+    message = data.get('message', '')
+    delay = data.get('delay', 0)
+    
+    if not account_ids or not group_ids or not message:
+        return jsonify({'error': 'Missing required parameters'}), 400
+    
+    api_id, api_hash = get_api_credentials()
+    accounts = get_all_accounts()
+    results = []
+    
+    try:
+        for account_id in account_ids:
+            account = next((acc for acc in accounts if acc[0] == account_id), None)
+            if not account:
                 continue
             
-            for group in account.get('groups', []):
+            session_name = account[2]
+            client = TelegramClient(session_name, int(api_id), api_hash)
+            client.connect()
+            
+            for group_id in group_ids:
                 try:
-                    parse_mode = 'markdown' if use_markdown else None
-                    await group_manager.send_message(
-                        client, 
-                        group['entity'], 
-                        message,
-                        parse_mode=parse_mode
-                    )
-                    total_sent += 1
-                    emit_log(f"✓ {group['title']} ({phone})")
-                    await asyncio.sleep(delay)
-                
+                    import time
+                    time.sleep(delay)
+                    client.send_message(int(group_id), message)
+                    results.append({
+                        'account_id': account_id,
+                        'group_id': group_id,
+                        'status': 'sent'
+                    })
                 except Exception as e:
-                    emit_log(f"✗ Error {group['title']}: {str(e)}")
+                    results.append({
+                        'account_id': account_id,
+                        'group_id': group_id,
+                        'status': 'failed',
+                        'error': str(e)
+                    })
+            
+            client.disconnect()
         
-        emit_log(f"\n🎉 Broadcast complete! {total_sent} messages sent 🎉")
-        return total_sent
-    
-    run_async(async_broadcast())
-    return jsonify({'success': True, 'message': 'Broadcast started'})
-
-# ==================== WEBSOCKET EVENTS ====================
-
-@socketio.on('connect')
-def handle_connect():
-    """Handle client connection"""
-    emit_log(f"🔗 Client connected")
-
-@socketio.on('disconnect')
-def handle_disconnect():
-    """Handle client disconnected"""
-    emit_log(f"🔌 Client disconnected")
-
-# ==================== ERROR HANDLERS ====================
-
-@app.errorhandler(404)
-def not_found(error):
-    return jsonify({'error': 'Not found'}), 404
-
-@app.errorhandler(500)
-def server_error(error):
-    return jsonify({'error': 'Server error'}), 500
-
-# ==================== MAIN ====================
+        return jsonify({
+            'success': True,
+            'results': results,
+            'total_sent': sum(1 for r in results if r['status'] == 'sent')
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 400
 
 if __name__ == '__main__':
-    # Start asyncio loop
-    start_asyncio_loop()
-    
-    # Check if configured
-    if not config.is_configured():
-        print("\n" + "="*60)
-        print("🦇 BATMAN - Telegram Multi-Account Manager")
-        print("="*60)
-        print("⚠️  First run detected - Please configure API credentials")
-        print("\n📡 Open http://localhost:5000 in your browser")
-        print("="*60 + "\n")
-    else:
-        print("\n" + "="*60)
-        print("🦇 BATMAN - Telegram Multi-Account Manager")
-        print("="*60)
-        print("✓ Configured and ready to use")
-        print("📡 Open http://localhost:5000 in your browser")
-        print("="*60 + "\n")
-    
-    print("Press Ctrl+C to stop\n")
-    
-    socketio.run(app, debug=False, host='0.0.0.0', port=5000, allow_unsafe_werkzeug=True)
+    app.run(debug=True, host='localhost', port=5000)
