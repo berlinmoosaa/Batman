@@ -4,12 +4,11 @@ import os
 import sqlite3
 from datetime import datetime
 import hashlib
-import asyncio
-import threading
-import sys
 import logging
-from concurrent.futures import ThreadPoolExecutor
-from telethon import TelegramClient
+import sys
+
+# Telethon imports
+from telethon.sync import TelegramClient
 from telethon.errors import SessionPasswordNeededError
 
 # ==================== LOGGING SETUP ====================
@@ -23,18 +22,6 @@ CORS(app)
 
 DB_FILE = 'telegram_data.db'
 
-# ==================== EXECUTOR FOR ASYNC TASKS ====================
-# Use ThreadPoolExecutor to run async code in separate threads
-executor = ThreadPoolExecutor(max_workers=5)
-
-# ==================== WINDOWS ASYNCIO FIX ====================
-def setup_asyncio():
-    """Setup asyncio for Windows compatibility"""
-    if sys.platform == 'win32':
-        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-
-setup_asyncio()
-
 # ==================== DATABASE CONNECTION ====================
 def get_db_connection(db_path):
     """Create a database connection with timeout"""
@@ -42,24 +29,6 @@ def get_db_connection(db_path):
     conn.execute('PRAGMA journal_mode=WAL')
     conn.execute('PRAGMA busy_timeout = 5000')
     return conn
-
-# ==================== ASYNC EXECUTOR WRAPPER ====================
-def run_in_executor(async_func):
-    """
-    Run async function in a dedicated thread with its own event loop.
-    This completely isolates async operations from Flask's threading.
-    """
-    def run_async_in_thread():
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        try:
-            return loop.run_until_complete(async_func)
-        finally:
-            loop.close()
-    
-    # Run in thread pool
-    future = executor.submit(run_async_in_thread)
-    return future.result(timeout=120)  # 120 second timeout
 
 # ==================== INITIALIZE DATABASE ====================
 def init_db():
@@ -166,86 +135,106 @@ def save_groups(account_id, groups_list):
         logger.error(f"Error saving groups: {e}")
         raise
 
-# ==================== ASYNC TELEGRAM FUNCTIONS ====================
-async def telegram_login(phone, api_id, api_hash, session_name):
-    """Async function to login to Telegram"""
-    client = TelegramClient(session_name, int(api_id), api_hash)
-    await client.connect()
-    
-    if not await client.is_user_authorized():
-        await client.send_code_request(phone)
-        await client.disconnect()
-        return {'success': True, 'status': 'code_required', 'phone': phone, 'session_name': session_name}
-    else:
-        account_id = save_account(phone, session_name)
-        await client.disconnect()
-        return {'success': True, 'status': 'logged_in', 'account_id': account_id, 'phone': phone}
+# ==================== TELETHON SYNC FUNCTIONS ====================
+# Using TelegramClient.sync() - no async/await needed!
 
-async def telegram_verify(phone, code, api_id, api_hash, session_name):
-    """Async function to verify code"""
-    client = TelegramClient(session_name, int(api_id), api_hash)
-    await client.connect()
-    
+def telegram_login(phone, api_id, api_hash, session_name):
+    """Synchronous login to Telegram"""
     try:
-        await client.sign_in(phone, code)
-    except SessionPasswordNeededError:
-        await client.disconnect()
-        return {'error': '2FA not supported yet'}
-    
-    account_id = save_account(phone, session_name)
-    await client.disconnect()
-    return {'success': True, 'status': 'verified', 'account_id': account_id, 'phone': phone}
-
-async def telegram_load_groups(session_name, api_id, api_hash, account_id):
-    """Async function to load groups"""
-    client = TelegramClient(session_name, int(api_id), api_hash)
-    await client.connect()
-    
-    groups = []
-    async for dialog in client.get_dialogs():
-        if dialog.is_group or dialog.is_channel:
-            groups.append({
-                'id': dialog.id,
-                'title': dialog.title,
-                'username': dialog.entity.username if hasattr(dialog.entity, 'username') else None,
-                'members_count': dialog.entity.participants_count if hasattr(dialog.entity, 'participants_count') else 0
-            })
-    
-    save_groups(account_id, groups)
-    await client.disconnect()
-    return {'success': True, 'groups': groups, 'count': len(groups)}
-
-async def telegram_send_messages(account_ids, group_ids, message, delay, api_id, api_hash, accounts):
-    """Async function to send messages"""
-    results = []
-    
-    for account_id in account_ids:
-        account = next((acc for acc in accounts if acc[0] == account_id), None)
-        if not account:
-            continue
+        client = TelegramClient(session_name, int(api_id), api_hash)
+        client.connect()
         
-        session_name = account[2]
+        if not client.is_user_authorized():
+            client.send_code_request(phone)
+            client.disconnect()
+            return {'success': True, 'status': 'code_required', 'phone': phone, 'session_name': session_name}
+        else:
+            account_id = save_account(phone, session_name)
+            client.disconnect()
+            return {'success': True, 'status': 'logged_in', 'account_id': account_id, 'phone': phone}
+    except Exception as e:
+        logger.error(f"Telegram login error: {e}")
+        raise
+
+def telegram_verify(phone, code, api_id, api_hash, session_name):
+    """Synchronous verify code"""
+    try:
+        client = TelegramClient(session_name, int(api_id), api_hash)
+        client.connect()
         
         try:
-            client = TelegramClient(session_name, int(api_id), api_hash)
-            await client.connect()
+            client.sign_in(phone, code)
+        except SessionPasswordNeededError:
+            client.disconnect()
+            return {'error': '2FA password required - not supported yet'}
+        
+        account_id = save_account(phone, session_name)
+        client.disconnect()
+        return {'success': True, 'status': 'verified', 'account_id': account_id, 'phone': phone}
+    except Exception as e:
+        logger.error(f"Telegram verify error: {e}")
+        raise
+
+def telegram_load_groups(session_name, api_id, api_hash, account_id):
+    """Synchronous load groups"""
+    try:
+        client = TelegramClient(session_name, int(api_id), api_hash)
+        client.connect()
+        
+        groups = []
+        for dialog in client.get_dialogs():
+            if dialog.is_group or dialog.is_channel:
+                groups.append({
+                    'id': dialog.id,
+                    'title': dialog.title,
+                    'username': dialog.entity.username if hasattr(dialog.entity, 'username') else None,
+                    'members_count': dialog.entity.participants_count if hasattr(dialog.entity, 'participants_count') else 0
+                })
+        
+        save_groups(account_id, groups)
+        client.disconnect()
+        return {'success': True, 'groups': groups, 'count': len(groups)}
+    except Exception as e:
+        logger.error(f"Telegram load groups error: {e}")
+        raise
+
+def telegram_send_messages(account_ids, group_ids, message, delay, api_id, api_hash, accounts):
+    """Synchronous send messages"""
+    try:
+        import time
+        results = []
+        
+        for account_id in account_ids:
+            account = next((acc for acc in accounts if acc[0] == account_id), None)
+            if not account:
+                continue
             
-            for group_id in group_ids:
-                try:
-                    await asyncio.sleep(delay)
-                    await client.send_message(int(group_id), message)
-                    logger.info(f"Message sent to group {group_id}")
-                    results.append({'account_id': account_id, 'group_id': group_id, 'status': 'sent'})
-                except Exception as e:
-                    logger.error(f"Failed to send message: {e}")
-                    results.append({'account_id': account_id, 'group_id': group_id, 'status': 'failed', 'error': str(e)})
+            session_name = account[2]
             
-            await client.disconnect()
-        except Exception as e:
-            logger.error(f"Send message error for account {account_id}: {e}")
-            results.append({'account_id': account_id, 'group_id': 'all', 'status': 'failed', 'error': str(e)})
-    
-    return results
+            try:
+                client = TelegramClient(session_name, int(api_id), api_hash)
+                client.connect()
+                
+                for group_id in group_ids:
+                    try:
+                        if delay > 0:
+                            time.sleep(delay)
+                        client.send_message(int(group_id), message)
+                        logger.info(f"Message sent to group {group_id}")
+                        results.append({'account_id': account_id, 'group_id': group_id, 'status': 'sent'})
+                    except Exception as e:
+                        logger.error(f"Failed to send message: {e}")
+                        results.append({'account_id': account_id, 'group_id': group_id, 'status': 'failed', 'error': str(e)})
+                
+                client.disconnect()
+            except Exception as e:
+                logger.error(f"Send message error for account {account_id}: {e}")
+                results.append({'account_id': account_id, 'group_id': 'all', 'status': 'failed', 'error': str(e)})
+        
+        return results
+    except Exception as e:
+        logger.error(f"Telegram send messages error: {e}")
+        raise
 
 # ==================== FLASK ROUTES ====================
 @app.route('/')
@@ -298,8 +287,7 @@ def login():
         logger.info(f"Login attempt for phone: {phone}")
         
         try:
-            # Run async code in executor
-            result = run_in_executor(telegram_login(phone, api_id, api_hash, session_name))
+            result = telegram_login(phone, api_id, api_hash, session_name)
             return jsonify(result)
         except Exception as e:
             logger.error(f"Login error: {e}")
@@ -324,7 +312,7 @@ def verify():
         logger.info(f"Verify attempt for phone: {phone}")
         
         try:
-            result = run_in_executor(telegram_verify(phone, code, api_id, api_hash, session_name))
+            result = telegram_verify(phone, code, api_id, api_hash, session_name)
             if 'error' in result:
                 return jsonify(result), 400
             return jsonify(result)
@@ -366,7 +354,7 @@ def load_groups():
         logger.info(f"Loading groups for account {account_id}")
         
         try:
-            result = run_in_executor(telegram_load_groups(session_name, api_id, api_hash, account_id))
+            result = telegram_load_groups(session_name, api_id, api_hash, account_id)
             return jsonify(result)
         except Exception as e:
             logger.error(f"Load groups error: {e}")
@@ -403,7 +391,7 @@ def send_message():
         logger.info(f"Sending message to {len(group_ids)} groups from {len(account_ids)} accounts")
         
         try:
-            results = run_in_executor(telegram_send_messages(account_ids, group_ids, message, delay, api_id, api_hash, accounts))
+            results = telegram_send_messages(account_ids, group_ids, message, delay, api_id, api_hash, accounts)
             
             return jsonify({
                 'success': True,
