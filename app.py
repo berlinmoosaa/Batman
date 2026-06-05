@@ -1,13 +1,13 @@
 from flask import Flask, render_template, request, jsonify
 from flask_cors import CORS
-from telethon.sync import TelegramClient
-from telethon.errors import SessionPasswordNeededError
 import os
 import sqlite3
 from datetime import datetime
 import hashlib
 import threading
 import time
+from telethon import TelegramClient
+from telethon.errors import SessionPasswordNeededError
 
 app = Flask(__name__)
 app.secret_key = 'batman_secret_key_2026'
@@ -23,21 +23,27 @@ def get_db_connection(db_path):
     conn.execute('PRAGMA busy_timeout = 5000')
     return conn
 
-# ==================== TELETHON THREAD-SAFE HANDLER ====================
+# ==================== TELETHON ASYNC HANDLER ====================
+import asyncio
+from telethon.sync import TelegramClient as SyncTelegramClient
+
 class TelegramClientManager:
-    """Thread-safe manager for Telethon clients"""
+    """Thread-safe manager for Telethon clients using async properly"""
     _lock = threading.Lock()
     _clients = {}
     
     @classmethod
-    def get_client(cls, session_name, api_id, api_hash):
-        """Get or create a client for the session"""
+    def get_client_sync(cls, session_name, api_id, api_hash):
+        """Get or create a synchronous Telethon client"""
         with cls._lock:
             if session_name not in cls._clients:
                 try:
-                    client = TelegramClient(session_name, int(api_id), api_hash)
-                    client.connect()
-                    cls._clients[session_name] = client
+                    print(f"[INFO] Creating new client for {session_name}")
+                    # Use SyncTelegramClient which handles asyncio internally
+                    client = SyncTelegramClient(session_name, int(api_id), api_hash)
+                    with client:
+                        pass  # Just connect and disconnect to verify
+                    cls._clients[session_name] = SyncTelegramClient(session_name, int(api_id), api_hash)
                 except Exception as e:
                     print(f"[ERROR] Failed to create client: {e}")
                     raise
@@ -142,6 +148,7 @@ def save_settings():
         save_api_credentials(api_id, api_hash)
         return jsonify({'success': True})
     except Exception as e:
+        print(f"[ERROR] Save settings: {str(e)}")
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/login', methods=['POST'])
@@ -164,29 +171,28 @@ def login():
             print(f"[API] login called")
             print(f"[API] Phone received: {phone}")
             
-            # Use TelegramClientManager for thread-safe operations
-            client = TelegramClientManager.get_client(session_name, api_id, api_hash)
-            
-            print(f"[API] Creating Telethon client...")
-            
-            if not client.is_user_authorized():
-                print(f"[API] Not authorized, sending code request")
-                client.send_code_request(phone)
-                return jsonify({
-                    'success': True,
-                    'status': 'code_required',
-                    'phone': phone,
-                    'session_name': session_name
-                })
-            else:
-                print(f"[API] Already authorized")
-                account_id = save_account(phone, session_name)
-                return jsonify({
-                    'success': True,
-                    'status': 'logged_in',
-                    'account_id': account_id,
-                    'phone': phone
-                })
+            # Create a context-based client connection
+            with SyncTelegramClient(session_name, int(api_id), api_hash) as client:
+                print(f"[API] Connected to Telegram")
+                
+                if not client.is_user_authorized():
+                    print(f"[API] Not authorized, sending code request")
+                    client.send_code_request(phone)
+                    return jsonify({
+                        'success': True,
+                        'status': 'code_required',
+                        'phone': phone,
+                        'session_name': session_name
+                    })
+                else:
+                    print(f"[API] Already authorized")
+                    account_id = save_account(phone, session_name)
+                    return jsonify({
+                        'success': True,
+                        'status': 'logged_in',
+                        'account_id': account_id,
+                        'phone': phone
+                    })
         except Exception as e:
             print(f"[API] EXCEPTION: {str(e)}")
             import traceback
@@ -210,23 +216,22 @@ def verify():
             return jsonify({'error': 'API credentials not found'}), 400
         
         try:
-            client = TelegramClientManager.get_client(session_name, api_id, api_hash)
-            
-            try:
-                print(f"[API] Attempting to sign in with code")
-                client.sign_in(phone, code)
-            except SessionPasswordNeededError:
-                return jsonify({'error': '2FA not supported yet'}), 400
-            
-            account_id = save_account(phone, session_name)
-            
-            print(f"[API] Successfully verified account")
-            return jsonify({
-                'success': True,
-                'status': 'verified',
-                'account_id': account_id,
-                'phone': phone
-            })
+            with SyncTelegramClient(session_name, int(api_id), api_hash) as client:
+                try:
+                    print(f"[API] Attempting to sign in with code")
+                    client.sign_in(phone, code)
+                except SessionPasswordNeededError:
+                    return jsonify({'error': '2FA not supported yet'}), 400
+                
+                account_id = save_account(phone, session_name)
+                
+                print(f"[API] Successfully verified account")
+                return jsonify({
+                    'success': True,
+                    'status': 'verified',
+                    'account_id': account_id,
+                    'phone': phone
+                })
         except Exception as e:
             print(f"[API] Verification error: {str(e)}")
             import traceback
@@ -264,23 +269,22 @@ def load_groups():
         session_name = account[2]
         
         try:
-            client = TelegramClientManager.get_client(session_name, api_id, api_hash)
-            
-            print(f"[API] Loading groups for account {account_id}")
-            groups = []
-            for dialog in client.get_dialogs():
-                if dialog.is_group or dialog.is_channel:
-                    groups.append({
-                        'id': dialog.id,
-                        'title': dialog.title,
-                        'username': dialog.entity.username if hasattr(dialog.entity, 'username') else None,
-                        'members_count': dialog.entity.participants_count if hasattr(dialog.entity, 'participants_count') else 0
-                    })
-            
-            save_groups(account_id, groups)
-            print(f"[API] Loaded {len(groups)} groups")
-            
-            return jsonify({'success': True, 'groups': groups, 'count': len(groups)})
+            with SyncTelegramClient(session_name, int(api_id), api_hash) as client:
+                print(f"[API] Loading groups for account {account_id}")
+                groups = []
+                for dialog in client.get_dialogs():
+                    if dialog.is_group or dialog.is_channel:
+                        groups.append({
+                            'id': dialog.id,
+                            'title': dialog.title,
+                            'username': dialog.entity.username if hasattr(dialog.entity, 'username') else None,
+                            'members_count': dialog.entity.participants_count if hasattr(dialog.entity, 'participants_count') else 0
+                        })
+                
+                save_groups(account_id, groups)
+                print(f"[API] Loaded {len(groups)} groups")
+                
+                return jsonify({'success': True, 'groups': groups, 'count': len(groups)})
         except Exception as e:
             print(f"[API] Load groups error: {str(e)}")
             import traceback
@@ -323,26 +327,25 @@ def send_message():
             session_name = account[2]
             
             try:
-                client = TelegramClientManager.get_client(session_name, api_id, api_hash)
-                
-                for group_id in group_ids:
-                    try:
-                        time.sleep(delay)
-                        client.send_message(int(group_id), message)
-                        print(f"[API] Message sent to group {group_id}")
-                        results.append({
-                            'account_id': account_id,
-                            'group_id': group_id,
-                            'status': 'sent'
-                        })
-                    except Exception as e:
-                        print(f"[API] Failed to send message: {str(e)}")
-                        results.append({
-                            'account_id': account_id,
-                            'group_id': group_id,
-                            'status': 'failed',
-                            'error': str(e)
-                        })
+                with SyncTelegramClient(session_name, int(api_id), api_hash) as client:
+                    for group_id in group_ids:
+                        try:
+                            time.sleep(delay)
+                            client.send_message(int(group_id), message)
+                            print(f"[API] Message sent to group {group_id}")
+                            results.append({
+                                'account_id': account_id,
+                                'group_id': group_id,
+                                'status': 'sent'
+                            })
+                        except Exception as e:
+                            print(f"[API] Failed to send message: {str(e)}")
+                            results.append({
+                                'account_id': account_id,
+                                'group_id': group_id,
+                                'status': 'failed',
+                                'error': str(e)
+                            })
             except Exception as e:
                 print(f"[API] Send message error for account {account_id}: {str(e)}")
                 results.append({
