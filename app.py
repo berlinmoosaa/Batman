@@ -4,123 +4,250 @@ import os
 import sqlite3
 from datetime import datetime
 import hashlib
-import time
 import asyncio
 import threading
 import sys
+import logging
+from concurrent.futures import ThreadPoolExecutor
 from telethon import TelegramClient
 from telethon.errors import SessionPasswordNeededError
 
+# ==================== LOGGING SETUP ====================
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# ==================== FLASK APP SETUP ====================
 app = Flask(__name__)
 app.secret_key = 'batman_secret_key_2026'
 CORS(app)
 
 DB_FILE = 'telegram_data.db'
 
-# ==================== WINDOWS ASYNCIO FIX ====================
-# This MUST be called before any asyncio usage
-if sys.platform == 'win32':
-    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+# ==================== EXECUTOR FOR ASYNC TASKS ====================
+# Use ThreadPoolExecutor to run async code in separate threads
+executor = ThreadPoolExecutor(max_workers=5)
 
-# ==================== DATABASE TIMEOUT FIX ====================
+# ==================== WINDOWS ASYNCIO FIX ====================
+def setup_asyncio():
+    """Setup asyncio for Windows compatibility"""
+    if sys.platform == 'win32':
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
+setup_asyncio()
+
+# ==================== DATABASE CONNECTION ====================
 def get_db_connection(db_path):
-    """Create a database connection with timeout and WAL mode enabled"""
+    """Create a database connection with timeout"""
     conn = sqlite3.connect(db_path, timeout=20.0, check_same_thread=False)
     conn.execute('PRAGMA journal_mode=WAL')
     conn.execute('PRAGMA busy_timeout = 5000')
     return conn
 
-# ==================== ASYNCIO EVENT LOOP FIX ====================
-# Store event loop per thread using threading.local()
-_thread_local = threading.local()
-
-def get_or_create_event_loop():
-    """Get or create event loop for current thread - handles Windows properly"""
-    try:
-        # Try to get existing loop
-        loop = asyncio.get_event_loop()
-        if loop.is_closed():
-            raise RuntimeError("Event loop is closed")
-        return loop
-    except (RuntimeError, AttributeError):
-        # Create new loop if none exists or it's closed
+# ==================== ASYNC EXECUTOR WRAPPER ====================
+def run_in_executor(async_func):
+    """
+    Run async function in a dedicated thread with its own event loop.
+    This completely isolates async operations from Flask's threading.
+    """
+    def run_async_in_thread():
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
-        return loop
-
-def run_async(coro):
-    """Run an async coroutine in the current thread - Windows/threading safe"""
-    try:
-        loop = asyncio.get_event_loop()
-        if loop.is_closed():
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-    except RuntimeError:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
+        try:
+            return loop.run_until_complete(async_func)
+        finally:
+            loop.close()
     
-    return loop.run_until_complete(coro)
+    # Run in thread pool
+    future = executor.submit(run_async_in_thread)
+    return future.result(timeout=120)  # 120 second timeout
 
-# Initialize database
-conn = get_db_connection(DB_FILE)
-c = conn.cursor()
-c.execute('CREATE TABLE IF NOT EXISTS settings (id INTEGER PRIMARY KEY, api_id TEXT, api_hash TEXT)')
-c.execute('CREATE TABLE IF NOT EXISTS accounts (id INTEGER PRIMARY KEY, phone TEXT, session_name TEXT, created_at TIMESTAMP)')
-c.execute('CREATE TABLE IF NOT EXISTS groups (id INTEGER PRIMARY KEY, account_id INTEGER, group_id INTEGER, group_name TEXT, group_username TEXT, members_count INTEGER, created_at TIMESTAMP)')
-conn.commit()
-conn.close()
+# ==================== INITIALIZE DATABASE ====================
+def init_db():
+    """Initialize database tables"""
+    try:
+        conn = get_db_connection(DB_FILE)
+        c = conn.cursor()
+        c.execute('CREATE TABLE IF NOT EXISTS settings (id INTEGER PRIMARY KEY, api_id TEXT, api_hash TEXT)')
+        c.execute('CREATE TABLE IF NOT EXISTS accounts (id INTEGER PRIMARY KEY, phone TEXT, session_name TEXT, created_at TIMESTAMP)')
+        c.execute('CREATE TABLE IF NOT EXISTS groups (id INTEGER PRIMARY KEY, account_id INTEGER, group_id INTEGER, group_name TEXT, group_username TEXT, members_count INTEGER, created_at TIMESTAMP)')
+        conn.commit()
+        conn.close()
+        logger.info("Database initialized successfully")
+    except Exception as e:
+        logger.error(f"Database initialization error: {e}")
 
+init_db()
+
+# ==================== DATABASE FUNCTIONS ====================
 def get_api_credentials():
-    conn = get_db_connection(DB_FILE)
-    c = conn.cursor()
-    c.execute('SELECT api_id, api_hash FROM settings LIMIT 1')
-    result = c.fetchone()
-    conn.close()
-    return result if result else (None, None)
+    """Get stored API credentials"""
+    try:
+        conn = get_db_connection(DB_FILE)
+        c = conn.cursor()
+        c.execute('SELECT api_id, api_hash FROM settings LIMIT 1')
+        result = c.fetchone()
+        conn.close()
+        return result if result else (None, None)
+    except Exception as e:
+        logger.error(f"Error getting API credentials: {e}")
+        return (None, None)
 
 def save_api_credentials(api_id, api_hash):
-    conn = get_db_connection(DB_FILE)
-    c = conn.cursor()
-    c.execute('DELETE FROM settings')
-    c.execute('INSERT INTO settings (api_id, api_hash) VALUES (?, ?)', (str(api_id), str(api_hash)))
-    conn.commit()
-    conn.close()
+    """Save API credentials"""
+    try:
+        conn = get_db_connection(DB_FILE)
+        c = conn.cursor()
+        c.execute('DELETE FROM settings')
+        c.execute('INSERT INTO settings (api_id, api_hash) VALUES (?, ?)', (str(api_id), str(api_hash)))
+        conn.commit()
+        conn.close()
+        logger.info("API credentials saved")
+    except Exception as e:
+        logger.error(f"Error saving API credentials: {e}")
+        raise
 
 def get_all_accounts():
-    conn = get_db_connection(DB_FILE)
-    c = conn.cursor()
-    c.execute('SELECT id, phone, session_name, created_at FROM accounts')
-    accounts = c.fetchall()
-    conn.close()
-    return accounts
+    """Get all registered accounts"""
+    try:
+        conn = get_db_connection(DB_FILE)
+        c = conn.cursor()
+        c.execute('SELECT id, phone, session_name, created_at FROM accounts')
+        accounts = c.fetchall()
+        conn.close()
+        return accounts
+    except Exception as e:
+        logger.error(f"Error getting accounts: {e}")
+        return []
 
 def save_account(phone, session_name):
-    conn = get_db_connection(DB_FILE)
-    c = conn.cursor()
-    c.execute('INSERT INTO accounts (phone, session_name, created_at) VALUES (?, ?, ?)', (phone, session_name, datetime.now()))
-    conn.commit()
-    account_id = c.lastrowid
-    conn.close()
-    return account_id
+    """Save a new account"""
+    try:
+        conn = get_db_connection(DB_FILE)
+        c = conn.cursor()
+        c.execute('INSERT INTO accounts (phone, session_name, created_at) VALUES (?, ?, ?)', 
+                  (phone, session_name, datetime.now()))
+        conn.commit()
+        account_id = c.lastrowid
+        conn.close()
+        logger.info(f"Account saved: {phone}")
+        return account_id
+    except Exception as e:
+        logger.error(f"Error saving account: {e}")
+        raise
 
 def get_groups_for_account(account_id):
-    conn = get_db_connection(DB_FILE)
-    c = conn.cursor()
-    c.execute('SELECT id, group_id, group_name, group_username, members_count FROM groups WHERE account_id = ?', (account_id,))
-    groups = c.fetchall()
-    conn.close()
-    return groups
+    """Get groups for an account"""
+    try:
+        conn = get_db_connection(DB_FILE)
+        c = conn.cursor()
+        c.execute('SELECT id, group_id, group_name, group_username, members_count FROM groups WHERE account_id = ?', 
+                  (account_id,))
+        groups = c.fetchall()
+        conn.close()
+        return groups
+    except Exception as e:
+        logger.error(f"Error getting groups: {e}")
+        return []
 
 def save_groups(account_id, groups_list):
-    conn = get_db_connection(DB_FILE)
-    c = conn.cursor()
-    c.execute('DELETE FROM groups WHERE account_id = ?', (account_id,))
-    for group in groups_list:
-        c.execute('INSERT INTO groups (account_id, group_id, group_name, group_username, members_count, created_at) VALUES (?, ?, ?, ?, ?, ?)',
-                  (account_id, group.get('id'), group.get('title'), group.get('username', 'N/A'), group.get('members_count', 0), datetime.now()))
-    conn.commit()
-    conn.close()
+    """Save groups for an account"""
+    try:
+        conn = get_db_connection(DB_FILE)
+        c = conn.cursor()
+        c.execute('DELETE FROM groups WHERE account_id = ?', (account_id,))
+        for group in groups_list:
+            c.execute('INSERT INTO groups (account_id, group_id, group_name, group_username, members_count, created_at) VALUES (?, ?, ?, ?, ?, ?)',
+                      (account_id, group.get('id'), group.get('title'), group.get('username', 'N/A'), 
+                       group.get('members_count', 0), datetime.now()))
+        conn.commit()
+        conn.close()
+        logger.info(f"Saved {len(groups_list)} groups for account {account_id}")
+    except Exception as e:
+        logger.error(f"Error saving groups: {e}")
+        raise
 
+# ==================== ASYNC TELEGRAM FUNCTIONS ====================
+async def telegram_login(phone, api_id, api_hash, session_name):
+    """Async function to login to Telegram"""
+    client = TelegramClient(session_name, int(api_id), api_hash)
+    await client.connect()
+    
+    if not await client.is_user_authorized():
+        await client.send_code_request(phone)
+        await client.disconnect()
+        return {'success': True, 'status': 'code_required', 'phone': phone, 'session_name': session_name}
+    else:
+        account_id = save_account(phone, session_name)
+        await client.disconnect()
+        return {'success': True, 'status': 'logged_in', 'account_id': account_id, 'phone': phone}
+
+async def telegram_verify(phone, code, api_id, api_hash, session_name):
+    """Async function to verify code"""
+    client = TelegramClient(session_name, int(api_id), api_hash)
+    await client.connect()
+    
+    try:
+        await client.sign_in(phone, code)
+    except SessionPasswordNeededError:
+        await client.disconnect()
+        return {'error': '2FA not supported yet'}
+    
+    account_id = save_account(phone, session_name)
+    await client.disconnect()
+    return {'success': True, 'status': 'verified', 'account_id': account_id, 'phone': phone}
+
+async def telegram_load_groups(session_name, api_id, api_hash, account_id):
+    """Async function to load groups"""
+    client = TelegramClient(session_name, int(api_id), api_hash)
+    await client.connect()
+    
+    groups = []
+    async for dialog in client.get_dialogs():
+        if dialog.is_group or dialog.is_channel:
+            groups.append({
+                'id': dialog.id,
+                'title': dialog.title,
+                'username': dialog.entity.username if hasattr(dialog.entity, 'username') else None,
+                'members_count': dialog.entity.participants_count if hasattr(dialog.entity, 'participants_count') else 0
+            })
+    
+    save_groups(account_id, groups)
+    await client.disconnect()
+    return {'success': True, 'groups': groups, 'count': len(groups)}
+
+async def telegram_send_messages(account_ids, group_ids, message, delay, api_id, api_hash, accounts):
+    """Async function to send messages"""
+    results = []
+    
+    for account_id in account_ids:
+        account = next((acc for acc in accounts if acc[0] == account_id), None)
+        if not account:
+            continue
+        
+        session_name = account[2]
+        
+        try:
+            client = TelegramClient(session_name, int(api_id), api_hash)
+            await client.connect()
+            
+            for group_id in group_ids:
+                try:
+                    await asyncio.sleep(delay)
+                    await client.send_message(int(group_id), message)
+                    logger.info(f"Message sent to group {group_id}")
+                    results.append({'account_id': account_id, 'group_id': group_id, 'status': 'sent'})
+                except Exception as e:
+                    logger.error(f"Failed to send message: {e}")
+                    results.append({'account_id': account_id, 'group_id': group_id, 'status': 'failed', 'error': str(e)})
+            
+            await client.disconnect()
+        except Exception as e:
+            logger.error(f"Send message error for account {account_id}: {e}")
+            results.append({'account_id': account_id, 'group_id': 'all', 'status': 'failed', 'error': str(e)})
+    
+    return results
+
+# ==================== FLASK ROUTES ====================
 @app.route('/')
 def index():
     return render_template('index.html')
@@ -149,7 +276,7 @@ def save_settings():
         save_api_credentials(api_id, api_hash)
         return jsonify({'success': True})
     except Exception as e:
-        print(f"[ERROR] Save settings: {str(e)}")
+        logger.error(f"Save settings error: {e}")
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/login', methods=['POST'])
@@ -168,47 +295,17 @@ def login():
         
         session_name = f'session_{hashlib.md5(phone.encode()).hexdigest()}'
         
+        logger.info(f"Login attempt for phone: {phone}")
+        
         try:
-            print(f"[API] login called")
-            print(f"[API] Phone received: {phone}")
-            
-            async def login_async():
-                client = TelegramClient(session_name, int(api_id), api_hash)
-                await client.connect()
-                
-                print(f"[API] Connected to Telegram")
-                
-                if not await client.is_user_authorized():
-                    print(f"[API] Not authorized, sending code request")
-                    await client.send_code_request(phone)
-                    await client.disconnect()
-                    return {
-                        'success': True,
-                        'status': 'code_required',
-                        'phone': phone,
-                        'session_name': session_name
-                    }
-                else:
-                    print(f"[API] Already authorized")
-                    account_id = save_account(phone, session_name)
-                    await client.disconnect()
-                    return {
-                        'success': True,
-                        'status': 'logged_in',
-                        'account_id': account_id,
-                        'phone': phone
-                    }
-            
-            result = run_async(login_async())
+            # Run async code in executor
+            result = run_in_executor(telegram_login(phone, api_id, api_hash, session_name))
             return jsonify(result)
-            
         except Exception as e:
-            print(f"[API] EXCEPTION: {str(e)}")
-            import traceback
-            traceback.print_exc()
+            logger.error(f"Login error: {e}")
             return jsonify({'error': f'Telegram error: {str(e)}'}), 400
     except Exception as e:
-        print(f"[API] General error: {str(e)}")
+        logger.error(f"General login error: {e}")
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/verify-code', methods=['POST'])
@@ -224,40 +321,18 @@ def verify():
         if not api_id or not api_hash:
             return jsonify({'error': 'API credentials not found'}), 400
         
+        logger.info(f"Verify attempt for phone: {phone}")
+        
         try:
-            async def verify_async():
-                client = TelegramClient(session_name, int(api_id), api_hash)
-                await client.connect()
-                
-                try:
-                    print(f"[API] Attempting to sign in with code")
-                    await client.sign_in(phone, code)
-                except SessionPasswordNeededError:
-                    await client.disconnect()
-                    return {'error': '2FA not supported yet'}
-                
-                account_id = save_account(phone, session_name)
-                print(f"[API] Successfully verified account")
-                await client.disconnect()
-                
-                return {
-                    'success': True,
-                    'status': 'verified',
-                    'account_id': account_id,
-                    'phone': phone
-                }
-            
-            result = run_async(verify_async())
+            result = run_in_executor(telegram_verify(phone, code, api_id, api_hash, session_name))
             if 'error' in result:
                 return jsonify(result), 400
             return jsonify(result)
-            
         except Exception as e:
-            print(f"[API] Verification error: {str(e)}")
-            import traceback
-            traceback.print_exc()
+            logger.error(f"Verification error: {e}")
             return jsonify({'error': f'Verification failed: {str(e)}'}), 400
     except Exception as e:
+        logger.error(f"General verify error: {e}")
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/accounts', methods=['GET'])
@@ -288,36 +363,16 @@ def load_groups():
         api_id, api_hash = get_api_credentials()
         session_name = account[2]
         
+        logger.info(f"Loading groups for account {account_id}")
+        
         try:
-            async def load_groups_async():
-                client = TelegramClient(session_name, int(api_id), api_hash)
-                await client.connect()
-                
-                print(f"[API] Loading groups for account {account_id}")
-                groups = []
-                async for dialog in client.get_dialogs():
-                    if dialog.is_group or dialog.is_channel:
-                        groups.append({
-                            'id': dialog.id,
-                            'title': dialog.title,
-                            'username': dialog.entity.username if hasattr(dialog.entity, 'username') else None,
-                            'members_count': dialog.entity.participants_count if hasattr(dialog.entity, 'participants_count') else 0
-                        })
-                
-                save_groups(account_id, groups)
-                print(f"[API] Loaded {len(groups)} groups")
-                await client.disconnect()
-                
-                return {'success': True, 'groups': groups, 'count': len(groups)}
-            
-            result = run_async(load_groups_async())
+            result = run_in_executor(telegram_load_groups(session_name, api_id, api_hash, account_id))
             return jsonify(result)
         except Exception as e:
-            print(f"[API] Load groups error: {str(e)}")
-            import traceback
-            traceback.print_exc()
+            logger.error(f"Load groups error: {e}")
             return jsonify({'error': str(e)}), 400
     except Exception as e:
+        logger.error(f"General load groups error: {e}")
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/groups/<int:account_id>', methods=['GET'])
@@ -344,58 +399,33 @@ def send_message():
         
         api_id, api_hash = get_api_credentials()
         accounts = get_all_accounts()
-        results = []
         
-        async def send_messages_async():
-            for account_id in account_ids:
-                account = next((acc for acc in accounts if acc[0] == account_id), None)
-                if not account:
-                    continue
-                
-                session_name = account[2]
-                
-                try:
-                    client = TelegramClient(session_name, int(api_id), api_hash)
-                    await client.connect()
-                    
-                    for group_id in group_ids:
-                        try:
-                            await asyncio.sleep(delay)
-                            await client.send_message(int(group_id), message)
-                            print(f"[API] Message sent to group {group_id}")
-                            results.append({
-                                'account_id': account_id,
-                                'group_id': group_id,
-                                'status': 'sent'
-                            })
-                        except Exception as e:
-                            print(f"[API] Failed to send message: {str(e)}")
-                            results.append({
-                                'account_id': account_id,
-                                'group_id': group_id,
-                                'status': 'failed',
-                                'error': str(e)
-                            })
-                    
-                    await client.disconnect()
-                except Exception as e:
-                    print(f"[API] Send message error for account {account_id}: {str(e)}")
-                    results.append({
-                        'account_id': account_id,
-                        'group_id': 'all',
-                        'status': 'failed',
-                        'error': str(e)
-                    })
+        logger.info(f"Sending message to {len(group_ids)} groups from {len(account_ids)} accounts")
         
-        run_async(send_messages_async())
-        
-        return jsonify({
-            'success': True,
-            'results': results,
-            'total_sent': sum(1 for r in results if r['status'] == 'sent')
-        })
+        try:
+            results = run_in_executor(telegram_send_messages(account_ids, group_ids, message, delay, api_id, api_hash, accounts))
+            
+            return jsonify({
+                'success': True,
+                'results': results,
+                'total_sent': sum(1 for r in results if r['status'] == 'sent')
+            })
+        except Exception as e:
+            logger.error(f"Send message error: {e}")
+            return jsonify({'error': str(e)}), 400
     except Exception as e:
+        logger.error(f"General send message error: {e}")
         return jsonify({'error': str(e)}), 500
 
+# ==================== ERROR HANDLERS ====================
+@app.errorhandler(500)
+def internal_error(error):
+    logger.error(f"Internal server error: {error}")
+    return jsonify({'error': 'Internal server error'}), 500
+
+@app.errorhandler(404)
+def not_found(error):
+    return jsonify({'error': 'Not found'}), 404
+
 if __name__ == '__main__':
-    app.run(debug=True, host='localhost', port=5000, threaded=True)
+    app.run(debug=False, host='0.0.0.0', port=5000, threaded=True)
